@@ -14,16 +14,32 @@ import (
 	"time"
 )
 
+// Version is the SDK version, sent as User-Agent: plateapi-go/<Version>.
+const Version = "0.2.0"
+
+const (
+	// DefaultMaxWait is the longest Retry-After the SDK sleeps before giving up with an error.
+	DefaultMaxWait = 60 * time.Second
+	// DefaultWalkDelay is the pause after each request in WalkVehicles.
+	DefaultWalkDelay = 150 * time.Millisecond
+
+	userAgent = "plateapi-go/" + Version
+)
+
 var validStates = map[string]bool{
 	"NSW": true, "VIC": true, "QLD": true, "SA": true,
 	"WA": true, "TAS": true, "NT": true, "ACT": true,
 }
+
+var validVehicleTypes = map[string]bool{"car": true, "motorcycle": true}
 
 type Client struct {
 	apiKey     string
 	baseURL    string
 	httpClient *http.Client
 	maxRetries int
+	maxWait    time.Duration
+	sleep      func(ctx context.Context, d time.Duration)
 }
 
 type Option func(*Client)
@@ -40,6 +56,12 @@ func WithMaxRetries(n int) Option {
 	return func(c *Client) { c.maxRetries = n }
 }
 
+// WithMaxWait sets the longest Retry-After the SDK will sleep (default 60 s). A Retry-After
+// above it returns the error at once instead of sleeping. d <= 0 removes the limit.
+func WithMaxWait(d time.Duration) Option {
+	return func(c *Client) { c.maxWait = d }
+}
+
 func WithHTTPClient(hc *http.Client) Option {
 	return func(c *Client) { c.httpClient = hc }
 }
@@ -50,6 +72,8 @@ func NewClient(apiKey string, opts ...Option) *Client {
 		baseURL:    "https://api.plateapi.com.au",
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 		maxRetries: 3,
+		maxWait:    DefaultMaxWait,
+		sleep:      sleepDuration,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -58,128 +82,125 @@ func NewClient(apiKey string, opts ...Option) *Client {
 }
 
 type httpResponse struct {
-	statusCode           int
-	body                 []byte
-	rateLimitLimit       string
-	rateLimitRemaining   string
-	rateLimitPlan        string
-	retryAfter           string
+	statusCode int
+	body       []byte
+	header     http.Header
 }
 
-func (c *Client) doRequest(ctx context.Context, path string, params url.Values, auth bool) (*httpResponse, error) {
+func (c *Client) canWait(d time.Duration) bool {
+	return c.maxWait <= 0 || d <= c.maxWait
+}
+
+func (c *Client) doRequest(ctx context.Context, path string, params url.Values, auth bool, maxRetries int) (*httpResponse, error) {
 	u := c.baseURL + path
 	if len(params) > 0 {
 		u += "?" + params.Encode()
 	}
 
-	var lastErr error
-
-	for attempt := 0; attempt <= c.maxRetries; attempt++ {
+	for attempt := 0; ; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 		if err != nil {
 			return nil, &APIError{Message: fmt.Sprintf("failed to create request: %v", err)}
 		}
 		req.Header.Set("Accept", "application/json")
+		req.Header.Set("User-Agent", userAgent)
 		if auth {
 			req.Header.Set("X-API-Key", c.apiKey)
 		}
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
-			lastErr = &APIError{Message: fmt.Sprintf("request failed: %v", err)}
-			if attempt < c.maxRetries {
-				sleepWithJitter(ctx, attempt)
+			if ctx.Err() == nil && attempt < maxRetries {
+				c.sleep(ctx, backoffDelay(attempt))
 				continue
 			}
-			return nil, lastErr
+			return nil, &APIError{Message: fmt.Sprintf("request failed: %v", err)}
 		}
 
 		body, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if err != nil {
-			lastErr = &APIError{Message: fmt.Sprintf("failed to read response: %v", err)}
-			if attempt < c.maxRetries {
-				sleepWithJitter(ctx, attempt)
+			if ctx.Err() == nil && attempt < maxRetries {
+				c.sleep(ctx, backoffDelay(attempt))
 				continue
 			}
-			return nil, lastErr
+			return nil, &APIError{Message: fmt.Sprintf("failed to read response: %v", err)}
 		}
 
-		hr := &httpResponse{
-			statusCode:         resp.StatusCode,
-			body:               body,
-			rateLimitLimit:     resp.Header.Get("X-RateLimit-Limit"),
-			rateLimitRemaining: resp.Header.Get("X-RateLimit-Remaining"),
-			rateLimitPlan:      resp.Header.Get("X-RateLimit-Plan"),
-			retryAfter:         resp.Header.Get("Retry-After"),
+		hr := &httpResponse{statusCode: resp.StatusCode, body: body, header: resp.Header}
+		if resp.StatusCode < 400 {
+			return hr, nil
 		}
 
-		if resp.StatusCode == 401 {
-			return nil, &AuthenticationError{APIError: APIError{Message: "Invalid API key", StatusCode: 401}}
+		var parsed map[string]interface{}
+		if json.Unmarshal(body, &parsed) != nil {
+			parsed = nil
 		}
+		base := APIError{
+			Message:    errorMessage(parsed, resp.StatusCode),
+			StatusCode: resp.StatusCode,
+			Code:       stringField(parsed, "code"),
+			RequestID:  stringField(parsed, "request_id"),
+		}
+		if base.RequestID == "" {
+			base.RequestID = resp.Header.Get("X-Request-ID")
+		}
+		retryAfter := parseRetryAfterPtr(resp.Header.Get("Retry-After"))
 
 		if resp.StatusCode == 429 {
-			var parsed map[string]interface{}
-			json.Unmarshal(body, &parsed)
-			if code, ok := parsed["code"].(string); ok && code == "quota_exceeded" {
-				return nil, &QuotaExceededError{APIError: APIError{Message: "Monthly quota exceeded", StatusCode: 429}}
+			if isQuotaExceeded(parsed) {
+				base.Code = "quota_exceeded"
+				return nil, &QuotaExceededError{RateLimitError: RateLimitError{APIError: base, RetryAfter: retryAfter}}
 			}
-
-			if attempt < c.maxRetries {
-				wait := backoffDelay(attempt)
-				if ra := parseRetryAfter(hr.retryAfter); ra > 0 {
-					wait = ra
+			wait := backoffDelay(attempt)
+			if retryAfter != nil {
+				wait = time.Duration(*retryAfter * float64(time.Second))
+			}
+			if attempt < maxRetries && c.canWait(wait) {
+				c.sleep(ctx, wait)
+				if ctx.Err() != nil {
+					return nil, &APIError{Message: fmt.Sprintf("request failed: %v", ctx.Err())}
 				}
-				sleepDuration(ctx, wait)
 				continue
 			}
-
-			ra := parseRetryAfterPtr(hr.retryAfter)
-			return nil, &RateLimitError{
-				APIError:   APIError{Message: "Rate limit exceeded", StatusCode: 429},
-				RetryAfter: ra,
-			}
+			return nil, &RateLimitError{APIError: base, RetryAfter: retryAfter}
 		}
 
 		if resp.StatusCode >= 500 {
-			if attempt < c.maxRetries {
-				wait := backoffDelay(attempt)
-				if ra := parseRetryAfter(hr.retryAfter); ra > 0 {
-					wait = ra
+			wait := backoffDelay(attempt)
+			if retryAfter != nil {
+				wait = time.Duration(*retryAfter * float64(time.Second))
+			}
+			if attempt < maxRetries && c.canWait(wait) {
+				c.sleep(ctx, wait)
+				if ctx.Err() != nil {
+					return nil, &APIError{Message: fmt.Sprintf("request failed: %v", ctx.Err())}
 				}
-				sleepDuration(ctx, wait)
 				continue
 			}
-
-			ra := parseRetryAfterPtr(hr.retryAfter)
-			return nil, &ServerError{
-				APIError:   APIError{Message: fmt.Sprintf("Server error (%d)", resp.StatusCode), StatusCode: resp.StatusCode},
-				RetryAfter: ra,
-			}
+			return nil, &ServerError{APIError: base, RetryAfter: retryAfter}
 		}
 
-		if resp.StatusCode >= 400 {
-			msg := "Request failed"
-			var parsed map[string]interface{}
-			if json.Unmarshal(body, &parsed) == nil {
-				if detail, ok := parsed["detail"].(string); ok {
-					msg = detail
-				} else if errMsg, ok := parsed["error"].(string); ok {
-					msg = errMsg
-				}
+		switch resp.StatusCode {
+		case 400:
+			return nil, &BadRequestError{APIError: base}
+		case 401:
+			return nil, &AuthenticationError{APIError: base}
+		case 403:
+			return nil, &PermissionDeniedError{APIError: base}
+		case 404:
+			if base.Code == "" {
+				base.Code = "not_found"
 			}
-			return nil, &APIError{Message: msg, StatusCode: resp.StatusCode}
+			return nil, &NotFoundError{APIError: base}
+		default:
+			return nil, &base
 		}
-
-		return hr, nil
 	}
-
-	if lastErr != nil {
-		return nil, lastErr
-	}
-	return nil, &APIError{Message: "request failed"}
 }
 
+// Lookup resolves a plate. A plate that does not resolve is a normal result with Success
+// false (and Code "not_found"), not an error.
 func (c *Client) Lookup(ctx context.Context, plate, state string, detailed bool) (*LookupResult, error) {
 	s := strings.ToUpper(strings.TrimSpace(state))
 	p := strings.ToUpper(strings.TrimSpace(plate))
@@ -196,14 +217,27 @@ func (c *Client) Lookup(ctx context.Context, plate, state string, detailed bool)
 		params.Set("detailed", "true")
 	}
 
-	resp, err := c.doRequest(ctx, "/api/v1/lookup", params, true)
-	if err != nil {
-		return nil, err
-	}
-
+	var resp *httpResponse
 	var result LookupResult
-	if err := json.Unmarshal(resp.body, &result); err != nil {
-		return nil, &APIError{Message: fmt.Sprintf("failed to parse response: %v", err)}
+	for attempt := 0; ; attempt++ {
+		var err error
+		resp, err = c.doRequest(ctx, "/api/v1/lookup", params, true, c.maxRetries)
+		if err != nil {
+			return nil, err
+		}
+		result = LookupResult{}
+		if err := json.Unmarshal(resp.body, &result); err != nil {
+			return nil, &APIError{Message: fmt.Sprintf("failed to parse response: %v", err)}
+		}
+		// internal_error is a 200 that is not billed; one more try usually succeeds.
+		if !result.Success && result.Code != nil && *result.Code == "internal_error" && attempt < c.maxRetries {
+			c.sleep(ctx, backoffDelay(attempt))
+			if ctx.Err() != nil {
+				return nil, &APIError{Message: fmt.Sprintf("request failed: %v", ctx.Err())}
+			}
+			continue
+		}
+		break
 	}
 
 	if result.Vehicle != nil && result.Vehicle.LowestYear != nil {
@@ -214,14 +248,26 @@ func (c *Client) Lookup(ctx context.Context, plate, state string, detailed bool)
 			result.Alternatives[i].Year = result.Alternatives[i].LowestYear
 		}
 	}
+	if result.RequestID == nil {
+		if rid := resp.header.Get("X-Request-ID"); rid != "" {
+			result.RequestID = &rid
+		}
+	}
 
-	result.RateLimit = parseRateLimit(resp)
+	result.RateLimit = parseRateLimit(resp.header)
 	return &result, nil
 }
 
+// Vehicles returns one level of the vehicle database cascade.
 func (c *Client) Vehicles(ctx context.Context, opts *VehiclesOptions) (*VehiclesResult, error) {
 	params := url.Values{}
 	if opts != nil {
+		if opts.VehicleType != nil {
+			if !validVehicleTypes[*opts.VehicleType] {
+				return nil, fmt.Errorf("invalid vehicle type %q, must be one of: car, motorcycle", *opts.VehicleType)
+			}
+			params.Set("type", *opts.VehicleType)
+		}
 		if opts.Make != nil {
 			params.Set("make", *opts.Make)
 		}
@@ -242,7 +288,7 @@ func (c *Client) Vehicles(ctx context.Context, opts *VehiclesOptions) (*Vehicles
 		}
 	}
 
-	resp, err := c.doRequest(ctx, "/api/v1/vehicles", params, true)
+	resp, err := c.doRequest(ctx, "/api/v1/vehicles", params, true, c.maxRetries)
 	if err != nil {
 		return nil, err
 	}
@@ -264,6 +310,8 @@ func (c *Client) Vehicles(ctx context.Context, opts *VehiclesOptions) (*Vehicles
 		Success:    raw.Success,
 		Total:      raw.Total,
 		DurationMs: raw.DurationMs,
+		Data:       []string{},
+		Vehicles:   []CascadeVehicle{},
 	}
 
 	if len(raw.Data) > 0 {
@@ -273,8 +321,15 @@ func (c *Client) Vehicles(ctx context.Context, opts *VehiclesOptions) (*Vehicles
 			var s string
 			if json.Unmarshal(item, &s) == nil {
 				result.Data = append(result.Data, s)
-			} else {
-				result.Data = append(result.Data, string(item))
+				continue
+			}
+			result.Data = append(result.Data, string(item))
+			if len(item) > 0 && item[0] == '{' {
+				var v CascadeVehicle
+				if json.Unmarshal(item, &v) == nil {
+					v.Raw = item
+					result.Vehicles = append(result.Vehicles, v)
+				}
 			}
 		}
 	}
@@ -282,8 +337,36 @@ func (c *Client) Vehicles(ctx context.Context, opts *VehiclesOptions) (*Vehicles
 	return result, nil
 }
 
+// VehicleByID returns one vehicle record. An unknown ID returns a *NotFoundError.
+func (c *Client) VehicleByID(ctx context.Context, vehicleID int) (*VehicleRecord, error) {
+	if vehicleID < 0 {
+		return nil, fmt.Errorf("vehicle ID must be a non-negative integer")
+	}
+	resp, err := c.doRequest(ctx, "/api/v1/vehicles/"+strconv.Itoa(vehicleID), nil, true, c.maxRetries)
+	if err != nil {
+		return nil, err
+	}
+	var raw struct {
+		Vehicle json.RawMessage `json:"vehicle"`
+	}
+	if err := json.Unmarshal(resp.body, &raw); err != nil {
+		return nil, &APIError{Message: fmt.Sprintf("failed to parse response: %v", err)}
+	}
+	record := &VehicleRecord{Years: []int{}}
+	if len(raw.Vehicle) > 0 && string(raw.Vehicle) != "null" {
+		if err := json.Unmarshal(raw.Vehicle, record); err != nil {
+			return nil, &APIError{Message: fmt.Sprintf("failed to parse response: %v", err)}
+		}
+		if record.Years == nil {
+			record.Years = []int{}
+		}
+		record.Raw = raw.Vehicle
+	}
+	return record, nil
+}
+
 func (c *Client) Usage(ctx context.Context) (*Usage, error) {
-	resp, err := c.doRequest(ctx, "/api/v1/keys/usage", nil, true)
+	resp, err := c.doRequest(ctx, "/api/v1/keys/usage", nil, true, c.maxRetries)
 	if err != nil {
 		return nil, err
 	}
@@ -328,7 +411,7 @@ func (c *Client) Logs(ctx context.Context, opts *LogsOptions) (*LogsResult, erro
 		}
 	}
 
-	resp, err := c.doRequest(ctx, "/api/v1/keys/logs", params, true)
+	resp, err := c.doRequest(ctx, "/api/v1/keys/logs", params, true, c.maxRetries)
 	if err != nil {
 		return nil, err
 	}
@@ -340,8 +423,9 @@ func (c *Client) Logs(ctx context.Context, opts *LogsOptions) (*LogsResult, erro
 	return &result, nil
 }
 
+// Health checks the API. No key is sent, no quota is used, and a single attempt is made.
 func (c *Client) Health(ctx context.Context) (*HealthStatus, error) {
-	resp, err := c.doRequest(ctx, "/api/v1/health", nil, false)
+	resp, err := c.doRequest(ctx, "/api/v1/health", nil, false, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -353,32 +437,60 @@ func (c *Client) Health(ctx context.Context) (*HealthStatus, error) {
 	return &result, nil
 }
 
-func parseRateLimit(resp *httpResponse) RateLimit {
-	rl := RateLimit{}
-	if v := resp.rateLimitLimit; v != "" && v != "unlimited" {
-		if n, err := strconv.Atoi(v); err == nil {
-			rl.Limit = &n
-		}
+func headerInt(h http.Header, name string) *int {
+	v := h.Get(name)
+	if v == "" || v == "unlimited" {
+		return nil
 	}
-	if v := resp.rateLimitRemaining; v != "" && v != "unlimited" {
-		if n, err := strconv.Atoi(v); err == nil {
-			rl.Remaining = &n
-		}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return nil
 	}
-	if v := resp.rateLimitPlan; v != "" {
+	return &n
+}
+
+func parseRateLimit(h http.Header) RateLimit {
+	rl := RateLimit{
+		Limit:          headerInt(h, "X-RateLimit-Limit"),
+		Remaining:      headerInt(h, "X-RateLimit-Remaining"),
+		TopupRemaining: headerInt(h, "X-Topup-Remaining"),
+	}
+	if v := h.Get("X-RateLimit-Plan"); v != "" {
 		rl.Plan = &v
 	}
 	return rl
+}
+
+func stringField(parsed map[string]interface{}, key string) string {
+	if parsed == nil {
+		return ""
+	}
+	if s, ok := parsed[key].(string); ok {
+		return s
+	}
+	return ""
+}
+
+func errorMessage(parsed map[string]interface{}, status int) string {
+	for _, key := range []string{"detail", "error"} {
+		if s := stringField(parsed, key); s != "" {
+			return s
+		}
+	}
+	return fmt.Sprintf("Request failed (HTTP %d)", status)
+}
+
+func isQuotaExceeded(parsed map[string]interface{}) bool {
+	if stringField(parsed, "code") == "quota_exceeded" {
+		return true
+	}
+	return strings.HasPrefix(strings.ToLower(stringField(parsed, "detail")), "monthly quota exceeded")
 }
 
 func backoffDelay(attempt int) time.Duration {
 	base := math.Pow(2, float64(attempt))
 	jitter := rand.Float64() * 0.5
 	return time.Duration((base + jitter) * float64(time.Second))
-}
-
-func sleepWithJitter(ctx context.Context, attempt int) {
-	sleepDuration(ctx, backoffDelay(attempt))
 }
 
 func sleepDuration(ctx context.Context, d time.Duration) {
@@ -390,26 +502,29 @@ func sleepDuration(ctx context.Context, d time.Duration) {
 	}
 }
 
-func parseRetryAfter(s string) time.Duration {
-	if s == "" {
-		return 0
-	}
-	if f, err := strconv.ParseFloat(s, 64); err == nil {
-		return time.Duration(f * float64(time.Second))
-	}
-	return 0
-}
-
 func parseRetryAfterPtr(s string) *float64 {
 	if s == "" {
 		return nil
 	}
-	if f, err := strconv.ParseFloat(s, 64); err == nil {
-		return &f
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil || f < 0 {
+		return nil
 	}
-	return nil
+	return &f
 }
 
 func String(s string) *string { return &s }
 func Int(i int) *int          { return &i }
 func Bool(b bool) *bool       { return &b }
+
+// Duration returns a pointer to d, for WalkOptions.Delay.
+func Duration(d time.Duration) *time.Duration { return &d }
+
+// KnownIDs builds a WalkOptions.Known map from vehicle IDs (for walks without PerYear).
+func KnownIDs(ids ...int) map[WalkKey]bool {
+	m := make(map[WalkKey]bool, len(ids))
+	for _, id := range ids {
+		m[WalkKey{VehicleID: id}] = true
+	}
+	return m
+}

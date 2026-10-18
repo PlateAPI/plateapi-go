@@ -34,7 +34,7 @@ func main() {
 
 		switch {
 		case errors.As(err, &authErr):
-			fmt.Fprintf(os.Stderr, "Invalid API key\n")
+			fmt.Fprintf(os.Stderr, "Invalid API key: %s\n", authErr.Message)
 		case errors.As(err, &quotaErr):
 			fmt.Fprintf(os.Stderr, "Monthly quota exceeded\n")
 		case errors.As(err, &rateErr):
@@ -58,6 +58,14 @@ func main() {
 		fmt.Printf("Year range: %s\n", deref(v.YearRange))
 		fmt.Printf("Body: %s\n", deref(v.Body))
 		fmt.Printf("Engine: %s\n", deref(v.Engine))
+		fmt.Printf("Match: %s\n", deref(result.Match))
+		if v.VehicleID != nil {
+			fmt.Printf("Vehicle ID: %d\n", *v.VehicleID)
+			record, err := client.VehicleByID(ctx, *v.VehicleID)
+			if err == nil {
+				fmt.Printf("Record: %s %s %s (%s)\n", deref(record.Make), deref(record.Model), deref(record.YearRange), deref(record.Detail))
+			}
+		}
 		if result.DurationMs != nil {
 			fmt.Printf("Duration: %.1fms\n", *result.DurationMs)
 		}
