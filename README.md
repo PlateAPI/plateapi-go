@@ -6,7 +6,7 @@ lookup and the PlateAPI vehicle database.
 ## Install
 
 ```bash
-go get github.com/PlateAPI/plateapi-go@v0.2.0
+go get github.com/PlateAPI/plateapi-go@v0.3.0
 ```
 
 Requires Go 1.21+. Zero external dependencies -- stdlib only.
@@ -185,7 +185,7 @@ Rules worth knowing:
   (database briefly unavailable) is retried by the SDK and then returned as a `*ServerError`.
 - Trims are filed as separate models (`HILUX`, `HILUX SR`, `HILUX SR5 EXTRA CAB`), so to cover a
   base model walk every model name that starts with it. `WalkVehicles()` below does this.
-- The vehicle level is a list: a few paths return two records whose catalogue entries overlap in
+- The vehicle level is a list: a few paths return two records whose year ranges overlap in
   that year. Use each record's description and `VehicleByID()` to tell them apart.
 - `VehicleID` identifies the variant, not the year: a variant returns the same ID under every
   model year it was sold.
@@ -343,7 +343,136 @@ Run it again later and it continues where it stopped.
 Keep a many-to-many table `(sku, vehicle_id)`. Walk the cascade once per fitment line to fill it,
 then on each plate lookup query the table by `result.Vehicle.VehicleID` (or every ID in
 `result.CandidateIDs()` when `Match` is `multiple`). Store IDs, not text. The full guide is at
-[plateapi.com.au/docs/vehicles](https://plateapi.com.au/docs/vehicles/#vehicles-skus).
+[plateapi.com.au/docs/vehicles](https://plateapi.com.au/docs/vehicles/#vehicles-skus). To keep
+that table current afterwards, see the next section.
+
+## Keeping vehicle IDs current
+
+If you store vehicle IDs or records in your own system (for example products mapped to
+vehicles), `AllVehicleChanges()` tells you what was added, updated or merged in the vehicle
+database since your last sync, so you do not have to walk the cascade again. Each change is a
+`VehicleID` with a short summary: make, model, year range, type and any new model years. Starter
+plans and above, the same 500 requests per minute as the rest of the vehicle database, and never
+counted against your lookup quota.
+
+```go
+func syncVehicles(ctx context.Context, client *plateapi.Client) error {
+    since := loadSince() // your code: the Until saved by the last sync
+    if since == "" {
+        since = time.Now().UTC().AddDate(0, 0, -7).Format("2006-01-02") // first run: the last 7 days
+    }
+
+    result, err := client.AllVehicleChanges(ctx, &plateapi.VehicleChangesOptions{Since: since})
+    if err != nil {
+        return err // nothing saved, so the next sync covers the same window again
+    }
+    for _, c := range result.Changes {
+        if !wanted(c.Make, c.Model) { // your code: skip the models you do not map
+            continue
+        }
+        switch c.Change {
+        case "added", "updated":
+            record, err := client.VehicleByID(ctx, c.VehicleID)
+            if err != nil {
+                return err
+            }
+            saveVehicle(record) // your code: insert or replace by vehicle ID
+        case "merged":
+            repoint(c.VehicleID, *c.MergedInto) // your code: move everything stored under the old ID
+        }
+    }
+    saveSince(result.Until) // your code: pass it as Since next time
+    return nil
+}
+```
+
+| `Change` | Meaning | What to do |
+|----------|---------|------------|
+| `added` | a new vehicle ID | fetch the record with `VehicleByID()` if you need it |
+| `updated` | an existing vehicle gained model years (listed in `NewYears`) or its record changed (`NewYears` empty) | if you store records, fetch it by ID and replace yours |
+| `merged` | `VehicleID` was a duplicate of `MergedInto`; the summary describes `MergedInto`, and the old ID still works with `VehicleByID()` | repoint anything stored under `VehicleID` to `*MergedInto` |
+
+Vehicle IDs are never deleted, so there is no removed kind. A vehicle first seen on a plate
+lookup appears as `added` with `Detail == "basic"`, then as `updated` when its full record
+arrives.
+
+### One page at a time
+
+`VehicleChanges()` returns one page; `AllVehicleChanges()` above reads every page for you and
+returns one result.
+
+```go
+page, err := client.VehicleChanges(ctx, &plateapi.VehicleChangesOptions{
+    Since: since, VehicleType: plateapi.String("car"), Limit: 100,
+})
+
+page.Success       // true
+page.Since         // "2026-11-01T00:00:00.000000Z"
+page.Until         // "2026-12-01T05:58:00.000000Z" -- store it, pass it as Since next time
+page.Type          // "car" or "motorcycle"
+page.Count         // changes on this page
+page.HasMore       // true when there is another page
+page.NextCursor    // the Cursor for the next page ("" on the last page)
+*page.DurationMs   // 9.4
+
+c := page.Changes[0]  // oldest change first
+c.VehicleID        // 1611220
+c.Change           // "added", "updated" or "merged"
+c.ChangedAt        // "2026-11-18T03:12:44.120318Z"
+c.NewYears         // [2027] (empty, never nil, when there are none)
+c.MergedInto       // *int: the ID a merged vehicle now resolves to, nil otherwise
+c.VehicleType      // "car" or "motorcycle"
+c.Make             // "TOYOTA"
+c.Model            // "HILUX SR"
+*c.YearRange       // "2020-ON" (nil when the vehicle has none)
+c.Detail           // "full" or "basic"
+c.Raw              // json.RawMessage of the change exactly as returned
+```
+
+While `HasMore` is true, call again with `Cursor: page.NextCursor` and the same `VehicleType`
+and `Limit` (`Since` can be left out, but not changed):
+
+```go
+opts := &plateapi.VehicleChangesOptions{Since: since, Limit: 100}
+for {
+    page, err := client.VehicleChanges(ctx, opts)
+    if err != nil {
+        return err
+    }
+    handle(page.Changes) // your code
+    if !page.HasMore {
+        saveSince(page.Until) // your code
+        break
+    }
+    opts = &plateapi.VehicleChangesOptions{Cursor: page.NextCursor, Limit: 100}
+}
+```
+
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `Since` | required unless `Cursor` is set | start of the window: an ISO 8601 date (`"2026-11-01"`, midnight UTC) or date-time (`"2026-11-01T05:58:00Z"`; no offset means UTC). Usually the `Until` of your last sync. From a `time.Time`, use `t.UTC().Format("2006-01-02")` or `t.UTC().Format(time.RFC3339)` (not `time.RFC3339Nano`) |
+| `VehicleType` | `nil` (`"car"`) | `"motorcycle"` for the motorcycle feed; cars and motorcycles are separate feeds, so sync each one you use |
+| `Limit` | `0` (not sent: 100) | changes per page, 1 to 100 |
+| `Cursor` | `""` | `NextCursor` of the previous page. `AllVehicleChanges()` ignores it |
+
+Rules worth knowing:
+
+- Store `Until` and pass it as `Since` next time. `Until` is the same on every page of one sync,
+  and a change made while you sync falls in the next window, so chaining them never skips a
+  change. A vehicle can show up in more than one sync: save by vehicle ID (insert or replace).
+- Changes go back at most 90 days, and not before 2026-10-20, so sync at least monthly (daily or
+  weekly is plenty: the database changes in batches, not by the minute). An older `Since`
+  returns a `*BadRequestError` with the API's message. If you fall further behind, walk the
+  cascade for the models you use, then sync from that day.
+- A new model year can touch thousands of vehicles at once. Skip the makes and models you do not
+  map before calling `VehicleByID()`; a `429` is retried after its `Retry-After` like any other
+  call (see "Retries and waiting").
+- No `Since` (and no `Cursor`), a `VehicleType` other than `"car"` / `"motorcycle"`, or a `Limit`
+  outside 1 to 100 returns an error before any request.
+- `AllVehicleChanges()` returns an `*APIError` instead of looping if the API ever says there is
+  more without sending a cursor, or sends the same cursor twice. It stops between pages when
+  `ctx` is cancelled.
+- Free and Lite keys get a `*PermissionDeniedError`.
 
 ## Account
 
@@ -409,7 +538,7 @@ text), `StatusCode`, `Code` (the API's machine code when it sent one) and `Reque
 
 | Type | HTTP | When |
 |------|------|------|
-| `*BadRequestError` | 400 | invalid plate, state, cascade parameter or vehicle ID |
+| `*BadRequestError` | 400 | invalid plate, state, cascade parameter or vehicle ID; a changes feed `Since` older than allowed, or an invalid `Cursor` |
 | `*AuthenticationError` | 401 | missing, invalid or deactivated key; email not verified |
 | `*PermissionDeniedError` | 403 | IP not on the key's allowlist, account banned, or vehicle database on a Free / Lite plan |
 | `*NotFoundError` | 404 | `VehicleByID()` with an unknown ID |
@@ -474,6 +603,12 @@ client := plateapi.NewClient("pk_live_your_api_key",
 Every request sends `User-Agent: plateapi-go/<version>` (`plateapi.Version`). All methods take a
 `context.Context` for cancellation and deadlines; a sleep between retries ends when the context
 does.
+
+## Upgrading from 0.2.0
+
+Everything written against 0.2.0 keeps working, with no behaviour changes. New in 0.3.0:
+`VehicleChanges()`, `AllVehicleChanges()` and the `VehicleChangesOptions`, `VehicleChange` and
+`VehicleChangesResult` types (see "Keeping vehicle IDs current").
 
 ## Upgrading from 0.1.0
 

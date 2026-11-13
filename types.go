@@ -131,6 +131,61 @@ type VehicleRecord struct {
 	Raw json.RawMessage `json:"-"`
 }
 
+// VehicleChangesOptions selects a page of the changes feed (GET /api/v1/vehicles/changes).
+type VehicleChangesOptions struct {
+	// Since is the start of the window: an ISO 8601 date ("2026-11-01") or date-time
+	// ("2026-11-01T05:58:00Z"); no offset means UTC. Required unless Cursor is set. It must be
+	// 2026-10-20 or later and within the last 90 days.
+	Since string
+	// VehicleType is "car" (default) or "motorcycle". Cars and motorcycles are separate feeds.
+	VehicleType *string
+	// Limit is the number of changes per page, 1 to 100. 0 is not sent (the API default is 100).
+	Limit int
+	// Cursor is NextCursor from the previous page. AllVehicleChanges ignores it.
+	Cursor string
+}
+
+// VehicleChange is one entry of the changes feed: a vehicle ID with a short summary.
+type VehicleChange struct {
+	VehicleID int `json:"vehicle_id"`
+	// Change is "added", "updated" or "merged". For "merged", VehicleID is the retired
+	// duplicate and MergedInto the ID it now resolves to; the summary describes MergedInto.
+	Change string `json:"change"`
+	// ChangedAt is when the change happened (ISO 8601, UTC).
+	ChangedAt string `json:"changed_at"`
+	// NewYears lists the model years an "updated" vehicle gained. Empty (never nil) when there
+	// are none, for example when the record itself changed.
+	NewYears []int `json:"new_years"`
+	// MergedInto is the ID a "merged" vehicle now resolves to; nil for other changes.
+	MergedInto  *int   `json:"merged_into,omitempty"`
+	VehicleType string `json:"vehicle_type"`
+	Make        string `json:"make"`
+	Model       string `json:"model"`
+	// YearRange is "2020-ON" style text; nil when the vehicle has none.
+	YearRange *string `json:"year_range,omitempty"`
+	// Detail is "full" or "basic", as on VehicleRecord.
+	Detail string `json:"detail"`
+	// Raw is the change object exactly as returned.
+	Raw json.RawMessage `json:"-"`
+}
+
+// VehicleChangesResult is one page of the changes feed or, from AllVehicleChanges, the whole
+// window. Store Until and pass it as Since on the next sync.
+type VehicleChangesResult struct {
+	Success bool `json:"success"`
+	// Since and Until bound the window. Until is the same on every page of one window.
+	Since string `json:"since"`
+	Until string `json:"until"`
+	// Type is "car" or "motorcycle".
+	Type    string          `json:"type"`
+	Count   int             `json:"count"`
+	Changes []VehicleChange `json:"changes"`
+	HasMore bool            `json:"has_more"`
+	// NextCursor is the Cursor for the next page while HasMore is true; "" on the last page.
+	NextCursor string   `json:"next_cursor"`
+	DurationMs *float64 `json:"duration_ms,omitempty"`
+}
+
 // WalkKey identifies a walked vehicle in WalkOptions.Known: Year is 0 unless PerYear is set.
 type WalkKey struct {
 	VehicleID int

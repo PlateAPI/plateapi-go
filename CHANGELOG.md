@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.0 -- 2026-11-13
+
+Every 0.2.0 program keeps working. New methods and types only; no behaviour changes.
+
+### Added
+
+- `Client.VehicleChanges(ctx, opts)` -> `*VehicleChangesResult`: one page of
+  `GET /api/v1/vehicles/changes`, the vehicles added, updated or merged since a date
+  (`Since`, `VehicleType`, `Limit`, `Cursor`). Argument errors (no `Since` or `Cursor`, an
+  unknown `VehicleType`, `Limit` outside 1 to 100) are returned before any request.
+- `Client.AllVehicleChanges(ctx, opts)`: follows `NextCursor` and returns every change in the
+  window as one result (`Count` the total, `DurationMs` the pages added up). Returns an
+  `*APIError` instead of looping if the API says there is more without a cursor or repeats one.
+- `VehicleChangesOptions`, `VehicleChange` (`MergedInto *int`, `YearRange *string`, `NewYears`
+  never nil, `Raw`) and `VehicleChangesResult` types.
+- README section "Keeping vehicle IDs current": store `Until`, pass it as `Since` next time,
+  what to do for added, updated and merged vehicles.
+
 ## 0.2.0 -- 2026-10-18
 
 Every 0.1.0 program keeps working. New fields and methods only; see "Upgrading from 0.1.0"

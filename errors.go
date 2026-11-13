@@ -19,7 +19,8 @@ func (e *APIError) Error() string {
 	return e.Message
 }
 
-// BadRequestError is HTTP 400: invalid plate, state, cascade value or vehicle ID.
+// BadRequestError is HTTP 400: invalid plate, state, cascade value or vehicle ID, or a changes
+// feed since, limit or cursor the API does not accept.
 type BadRequestError struct {
 	APIError
 }

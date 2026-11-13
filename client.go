@@ -15,7 +15,7 @@ import (
 )
 
 // Version is the SDK version, sent as User-Agent: plateapi-go/<Version>.
-const Version = "0.2.0"
+const Version = "0.3.0"
 
 const (
 	// DefaultMaxWait is the longest Retry-After the SDK sleeps before giving up with an error.

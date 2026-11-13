@@ -1,11 +1,14 @@
 package plateapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -616,6 +619,298 @@ func TestWalkErrorsAndStop(t *testing.T) {
 	}
 	if len(f.calls) != 0 {
 		t.Error("validation must not request")
+	}
+}
+
+// ---- changes feed ----
+
+var changeUpdated = map[string]interface{}{
+	"vehicle_id": 1611220, "change": "updated", "changed_at": "2026-11-18T03:12:44.120318Z",
+	"new_years": []int{2027}, "merged_into": nil, "vehicle_type": "car", "make": "TOYOTA",
+	"model": "HILUX SR", "year_range": "2020-ON", "detail": "full",
+}
+
+var changeMerged = map[string]interface{}{
+	"vehicle_id": 5000001, "change": "merged", "changed_at": "2026-11-18T04:00:00.000001Z",
+	"new_years": []int{}, "merged_into": 1611220, "vehicle_type": "car", "make": "TOYOTA",
+	"model": "HILUX SR", "year_range": nil, "detail": "full",
+}
+
+var changeAdded = map[string]interface{}{
+	"vehicle_id": 7000002, "change": "added", "changed_at": "2026-11-19T01:00:00.000000Z",
+	"merged_into": nil, "vehicle_type": "car", "make": "KIA", "model": "EV5",
+	"year_range": "2025-ON", "detail": "basic",
+}
+
+func changesPage(changes []interface{}, hasMore bool, nextCursor interface{}, durationMs float64, vehicleType string) fakeResponse {
+	if changes == nil {
+		changes = []interface{}{}
+	}
+	return ok(map[string]interface{}{
+		"success": true, "since": "2026-11-01T00:00:00.000000Z", "until": "2026-12-01T05:58:00.000000Z",
+		"type": vehicleType, "count": len(changes), "changes": changes, "has_more": hasMore,
+		"next_cursor": nextCursor, "duration_ms": durationMs,
+	}, nil)
+}
+
+func changeIDs(cs []VehicleChange) []int {
+	out := []int{}
+	for _, c := range cs {
+		out = append(out, c.VehicleID)
+	}
+	return out
+}
+
+func TestVehicleChangesParamsAndFields(t *testing.T) {
+	f := newFake(t, []fakeResponse{changesPage([]interface{}{changeUpdated, changeMerged}, true, "c1", 2.0, "car")})
+	r, err := f.client.VehicleChanges(context.Background(), &VehicleChangesOptions{Since: "2026-11-01", VehicleType: String("car"), Limit: 2})
+	must(t, err)
+	c := f.calls[0]
+	if c.path != "/api/v1/vehicles/changes" || !reflect.DeepEqual(c.params, map[string]string{"since": "2026-11-01", "type": "car", "limit": "2"}) {
+		t.Errorf("request: %+v", c)
+	}
+	if c.header.Get("X-API-Key") != "pk_live_test" || c.header.Get("User-Agent") != "plateapi-go/0.3.0" {
+		t.Errorf("headers: %v", c.header)
+	}
+	if !r.Success || r.Since != "2026-11-01T00:00:00.000000Z" || r.Until != "2026-12-01T05:58:00.000000Z" || r.Type != "car" || r.Count != 2 || !r.HasMore || r.NextCursor != "c1" || r.DurationMs == nil || *r.DurationMs != 2.0 {
+		t.Errorf("result: %+v", r)
+	}
+	if len(r.Changes) != 2 {
+		t.Fatalf("changes: %+v", r.Changes)
+	}
+	first, second := r.Changes[0], r.Changes[1]
+	if first.VehicleID != 1611220 || first.Change != "updated" || first.ChangedAt != "2026-11-18T03:12:44.120318Z" || !reflect.DeepEqual(first.NewYears, []int{2027}) || first.MergedInto != nil {
+		t.Errorf("first: %+v", first)
+	}
+	if first.VehicleType != "car" || first.Make != "TOYOTA" || first.Model != "HILUX SR" || deref(first.YearRange) != "2020-ON" || first.Detail != "full" {
+		t.Errorf("first summary: %+v", first)
+	}
+	var gotRaw, wantRaw map[string]interface{}
+	must(t, json.Unmarshal(first.Raw, &gotRaw))
+	must(t, json.Unmarshal([]byte(jsonBody(changeUpdated)), &wantRaw))
+	if !reflect.DeepEqual(gotRaw, wantRaw) {
+		t.Errorf("raw: %s", first.Raw)
+	}
+	if second.Change != "merged" || second.MergedInto == nil || *second.MergedInto != 1611220 || second.YearRange != nil || second.NewYears == nil || len(second.NewYears) != 0 {
+		t.Errorf("second: %+v", second)
+	}
+}
+
+func TestVehicleChangesSendsOnlyGivenParams(t *testing.T) {
+	f := newFake(t, []fakeResponse{
+		changesPage(nil, false, nil, 1.0, "car"),
+		changesPage(nil, false, nil, 1.0, "car"),
+		changesPage(nil, false, nil, 1.0, "motorcycle"),
+		changesPage(nil, false, nil, 1.0, "car"),
+	})
+	ctx := context.Background()
+	r, err := f.client.VehicleChanges(ctx, &VehicleChangesOptions{Since: "2026-11-01"})
+	must(t, err)
+	if r.Changes == nil || len(r.Changes) != 0 || r.Count != 0 || r.HasMore || r.NextCursor != "" {
+		t.Errorf("empty page: %+v", r)
+	}
+	_, err = f.client.VehicleChanges(ctx, &VehicleChangesOptions{Cursor: "abc"})
+	must(t, err)
+	r, err = f.client.VehicleChanges(ctx, &VehicleChangesOptions{Since: "2026-11-01", VehicleType: String("motorcycle")})
+	must(t, err)
+	if r.Type != "motorcycle" {
+		t.Errorf("motorcycle: %+v", r)
+	}
+	_, err = f.client.VehicleChanges(ctx, &VehicleChangesOptions{Since: "2026-11-01T05:58:00Z", Limit: 100})
+	must(t, err)
+	want := []map[string]string{
+		{"since": "2026-11-01"},
+		{"cursor": "abc"},
+		{"since": "2026-11-01", "type": "motorcycle"},
+		{"since": "2026-11-01T05:58:00Z", "limit": "100"},
+	}
+	for i, w := range want {
+		if !reflect.DeepEqual(f.calls[i].params, w) {
+			t.Errorf("call %d params: %+v, want %+v", i, f.calls[i].params, w)
+		}
+	}
+}
+
+func TestVehicleChangesMissingFields(t *testing.T) {
+	bare := map[string]interface{}{"vehicle_id": 9, "change": "updated", "new_years": nil}
+	f := newFake(t, []fakeResponse{changesPage([]interface{}{changeAdded, nil, bare}, false, nil, 1.0, "car")})
+	r, err := f.client.VehicleChanges(context.Background(), &VehicleChangesOptions{Since: "2026-11-01"})
+	must(t, err)
+	if len(r.Changes) != 2 {
+		t.Fatalf("non-object entries must be skipped: %+v", r.Changes)
+	}
+	added := r.Changes[0]
+	if added.NewYears == nil || len(added.NewYears) != 0 || added.Detail != "basic" || deref(added.YearRange) != "2025-ON" || added.MergedInto != nil {
+		t.Errorf("added: %+v", added)
+	}
+	b := r.Changes[1]
+	if b.VehicleID != 9 || b.NewYears == nil || len(b.NewYears) != 0 || b.MergedInto != nil || b.YearRange != nil || b.Make != "" || b.Detail != "" {
+		t.Errorf("bare: %+v", b)
+	}
+}
+
+func TestVehicleChangesArgumentErrors(t *testing.T) {
+	f := newFake(t, nil)
+	ctx := context.Background()
+	for _, opts := range []*VehicleChangesOptions{
+		nil,
+		{},
+		{VehicleType: String("car"), Limit: 10},
+		{Since: "2026-11-01", VehicleType: String("truck")},
+		{Since: "2026-11-01", Limit: -1},
+		{Since: "2026-11-01", Limit: 101},
+	} {
+		if _, err := f.client.VehicleChanges(ctx, opts); err == nil {
+			t.Errorf("VehicleChanges: expected argument error for %+v", opts)
+		}
+	}
+	for _, opts := range []*VehicleChangesOptions{
+		nil,
+		{},
+		{Cursor: "abc"},
+		{Since: "2026-11-01", VehicleType: String("truck")},
+		{Since: "2026-11-01", Limit: 101},
+	} {
+		if _, err := f.client.AllVehicleChanges(ctx, opts); err == nil {
+			t.Errorf("AllVehicleChanges: expected argument error for %+v", opts)
+		}
+	}
+	if len(f.calls) != 0 {
+		t.Error("argument errors must not request")
+	}
+}
+
+func TestVehicleChangesBadRequest(t *testing.T) {
+	message := "Invalid query parameters. since: must be 2026-10-20T00:00:00Z or later."
+	f := newFake(t, []fakeResponse{res(400, map[string]interface{}{"detail": message}, nil)})
+	_, err := f.client.VehicleChanges(context.Background(), &VehicleChangesOptions{Since: "2026-10-01"})
+	var br *BadRequestError
+	if !errors.As(err, &br) || br.Message != message || br.StatusCode != 400 {
+		t.Errorf("400: %T %v", err, err)
+	}
+	if len(f.calls) != 1 || len(f.sleeps) != 0 {
+		t.Errorf("400 must not retry: calls=%d sleeps=%d", len(f.calls), len(f.sleeps))
+	}
+}
+
+func TestAllVehicleChangesFollowsTheCursor(t *testing.T) {
+	f := newFake(t, []fakeResponse{
+		changesPage([]interface{}{changeUpdated}, true, "c1", 1.5, "car"),
+		changesPage([]interface{}{changeMerged, changeAdded}, false, nil, 2.5, "car"),
+	})
+	opts := &VehicleChangesOptions{Since: "2026-11-01", VehicleType: String("car"), Limit: 1, Cursor: "ignored"}
+	r, err := f.client.AllVehicleChanges(context.Background(), opts)
+	must(t, err)
+	if len(f.calls) != 2 {
+		t.Fatalf("calls: %d", len(f.calls))
+	}
+	if !reflect.DeepEqual(f.calls[0].params, map[string]string{"since": "2026-11-01", "type": "car", "limit": "1"}) {
+		t.Errorf("first page params: %+v", f.calls[0].params)
+	}
+	if !reflect.DeepEqual(f.calls[1].params, map[string]string{"cursor": "c1", "type": "car", "limit": "1"}) {
+		t.Errorf("second page params: %+v", f.calls[1].params)
+	}
+	if got := changeIDs(r.Changes); !reflect.DeepEqual(got, []int{1611220, 5000001, 7000002}) {
+		t.Errorf("changes: %v", got)
+	}
+	if r.Count != 3 || r.HasMore || r.NextCursor != "" || !r.Success || r.Type != "car" {
+		t.Errorf("combined: %+v", r)
+	}
+	if r.Since != "2026-11-01T00:00:00.000000Z" || r.Until != "2026-12-01T05:58:00.000000Z" {
+		t.Errorf("window: %q %q", r.Since, r.Until)
+	}
+	if r.DurationMs == nil || *r.DurationMs != 4.0 {
+		t.Errorf("duration: %v", r.DurationMs)
+	}
+	if opts.Cursor != "ignored" || opts.Since != "2026-11-01" {
+		t.Errorf("opts must not be changed: %+v", opts)
+	}
+	if len(f.sleeps) != 0 {
+		t.Errorf("no delay between pages: %v", f.sleeps)
+	}
+}
+
+func TestAllVehicleChangesSinglePage(t *testing.T) {
+	f := newFake(t, []fakeResponse{changesPage([]interface{}{changeUpdated}, false, nil, 2.0, "car")})
+	r, err := f.client.AllVehicleChanges(context.Background(), &VehicleChangesOptions{Since: "2026-11-01"})
+	must(t, err)
+	if len(f.calls) != 1 || r.Count != 1 || r.HasMore || r.DurationMs == nil || *r.DurationMs != 2.0 {
+		t.Errorf("single page: calls=%d %+v", len(f.calls), r)
+	}
+}
+
+func TestAllVehicleChangesGuards(t *testing.T) {
+	ctx := context.Background()
+	opts := &VehicleChangesOptions{Since: "2026-11-01"}
+	for _, cursor := range []interface{}{nil, ""} {
+		f := newFake(t, []fakeResponse{changesPage([]interface{}{changeUpdated}, true, cursor, 1.0, "car")})
+		_, err := f.client.AllVehicleChanges(ctx, opts)
+		var api *APIError
+		if !errors.As(err, &api) || api.StatusCode != 0 || len(f.calls) != 1 {
+			t.Errorf("has_more with cursor %v: %T %v calls=%d", cursor, err, err, len(f.calls))
+		}
+	}
+
+	f := newFake(t, []fakeResponse{
+		changesPage([]interface{}{changeUpdated}, true, "c1", 1.0, "car"),
+		changesPage([]interface{}{changeMerged}, true, "c1", 1.0, "car"),
+	})
+	_, err := f.client.AllVehicleChanges(ctx, opts)
+	var api *APIError
+	if !errors.As(err, &api) || api.StatusCode != 0 || len(f.calls) != 2 {
+		t.Errorf("repeated cursor: %T %v calls=%d", err, err, len(f.calls))
+	}
+
+	message := "Invalid query parameters. cursor: not a cursor from this endpoint."
+	f = newFake(t, []fakeResponse{
+		changesPage([]interface{}{changeUpdated}, true, "c1", 1.0, "car"),
+		res(400, map[string]interface{}{"detail": message}, nil),
+	})
+	_, err = f.client.AllVehicleChanges(ctx, opts)
+	var br *BadRequestError
+	if !errors.As(err, &br) || br.Message != message || len(f.calls) != 2 {
+		t.Errorf("error on a later page: %T %v calls=%d", err, err, len(f.calls))
+	}
+}
+
+// cancelAfterFirst cancels the context once the first response has been read in full, so the
+// cancellation lands between pages rather than during a request.
+type cancelAfterFirst struct {
+	next   http.RoundTripper
+	cancel context.CancelFunc
+	n      int
+}
+
+func (c *cancelAfterFirst) RoundTrip(r *http.Request) (*http.Response, error) {
+	resp, err := c.next.RoundTrip(r)
+	if err != nil {
+		return nil, err
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	c.n++
+	if c.n == 1 {
+		c.cancel()
+	}
+	return resp, nil
+}
+
+func TestAllVehicleChangesStopsWhenContextIsCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rt := &cancelAfterFirst{next: http.DefaultTransport, cancel: cancel}
+	f := newFake(t, []fakeResponse{
+		changesPage([]interface{}{changeUpdated}, true, "c1", 1.0, "car"),
+		changesPage([]interface{}{changeMerged}, false, nil, 1.0, "car"),
+	}, WithHTTPClient(&http.Client{Transport: rt}))
+	r, err := f.client.AllVehicleChanges(ctx, &VehicleChangesOptions{Since: "2026-11-01"})
+	var api *APIError
+	if r != nil || !errors.As(err, &api) || !strings.Contains(api.Message, "context canceled") || len(f.calls) != 1 {
+		t.Errorf("cancelled: %v %v calls=%d", r, err, len(f.calls))
 	}
 }
 
