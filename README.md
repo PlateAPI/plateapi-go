@@ -19,6 +19,7 @@ package main
 import (
     "context"
     "fmt"
+    "log"
 
     plateapi "github.com/PlateAPI/plateapi-go"
 )
@@ -28,13 +29,28 @@ func main() {
 
     result, err := client.Lookup(context.Background(), "ABC123", "VIC", false)
     if err != nil {
-        panic(err)
+        log.Fatal(err) // *plateapi.APIError: bad key (401), rate limit or quota (429), ...
     }
-    if result.Success && result.Vehicle != nil {
-        fmt.Println(*result.Vehicle.Make, *result.Vehicle.Model, *result.Vehicle.YearRange)
-        fmt.Println(*result.Vehicle.VehicleID)   // PlateAPI's stable ID for this variant
-        fmt.Println(*result.Match)               // "exact", "multiple" or "ambiguous"
+    if !result.Success || result.Vehicle == nil {
+        fmt.Println("no record for this plate") // not found is HTTP 200 with no vehicle
+        return
     }
+    v := result.Vehicle
+    fmt.Println(str(v.Make), str(v.Model), str(v.YearRange))
+    if v.VehicleID != nil { // nil on an "ambiguous" match: the candidates are in Alternatives
+        fmt.Println(*v.VehicleID) // PlateAPI's stable ID for this variant
+    }
+    if result.Match != nil {
+        fmt.Println(*result.Match) // "exact", "multiple" or "ambiguous"
+    }
+}
+
+// str prints an optional field: every text field can be missing.
+func str(s *string) string {
+    if s == nil {
+        return ""
+    }
+    return *s
 }
 ```
 
@@ -100,12 +116,17 @@ could not be identified with certainty; an ID is never guessed.
 | `ambiguous` | candidates are different makes or models, or different generations; `Vehicle.VehicleID` is `nil` and `Alternatives` lists every candidate (including the one shown as `Vehicle`) with its ID | `result.CandidateIDs()` (a picker is best) |
 
 ```go
-result, _ := client.Lookup(ctx, "ABC123", "VIC", false)
-if result.Match != nil && *result.Match == "exact" {
+result, err := client.Lookup(ctx, "ABC123", "VIC", false)
+if err != nil || result.Vehicle == nil {
+    return // an error, or no record for this plate
+}
+if result.Match != nil && *result.Match == "exact" && result.Vehicle.VehicleID != nil {
     save(*result.Vehicle.VehicleID)
 } else {
     for _, alt := range result.Alternatives {
-        fmt.Println(*alt.VehicleID, *alt.Description, *alt.YearRange)
+        if alt.VehicleID != nil {
+            fmt.Println(*alt.VehicleID, str(alt.Description), str(alt.YearRange))
+        }
     }
     saveAll(result.CandidateIDs())
 }
@@ -523,10 +544,16 @@ Plate `TEST123` with any state returns a fixed vehicle instantly: free, no quota
 A valid key is still required. Use it in integration tests and CI.
 
 ```go
-result, _ := client.Lookup(ctx, "TEST123", "VIC", false)
+result, err := client.Lookup(ctx, "TEST123", "VIC", false)
+if err != nil {
+    log.Fatal(err) // TEST123 still needs a valid key
+}
 result.Sandbox                 // true
-*result.Vehicle.VehicleID      // 1380801
-record, _ := client.VehicleByID(ctx, *result.Vehicle.VehicleID)
+*result.Vehicle.VehicleID      // 1380801 (the sandbox vehicle always has an ID)
+record, err := client.VehicleByID(ctx, *result.Vehicle.VehicleID)
+if err != nil {
+    log.Fatal(err)
+}
 *record.Model                  // "HILUX SR"
 ```
 
